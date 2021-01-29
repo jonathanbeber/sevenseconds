@@ -566,6 +566,7 @@ def configure_routing_table(vpc: object, nat_instance_by_az: dict, replace_defau
 def create_vpc_endpoints(account: AccountData, vpc: object, region: str):
     ec2c = account.session.client('ec2', region)
     router_tables = set([rt.id for rt in vpc.route_tables.all()])
+    subnets = set([subnet.id for subnet in filter_subnets(vpc, "internal")])
     service_names = ec2c.describe_vpc_endpoint_services()['ServiceNames']
 
     for service_name in service_names:
@@ -622,6 +623,100 @@ def create_vpc_endpoints(account: AccountData, vpc: object, region: str):
                             ).encode('utf-8')).hexdigest()
                     }
                     act.warning('missing, make create: {}'.format(ec2c.create_vpc_endpoint(**options)))
+        elif service_name.endswith('.kms'):
+            with ActionOnExit('Checking VPC Endpoint {}..'.format(service_name)) as act:
+                sg_name = 'KMS VPC Endpoint'
+                sg_desc = 'Allow access to the KMS VPC endpoint'
+                sg = get_sg(sg_name, sg_desc, vpc.security_groups.all())
+                if not sg:
+                    sg = vpc.create_security_group(
+                        GroupName=sg_name,
+                        Description=sg_desc,
+                    )
+                    time.sleep(2)
+                    sg.create_tags(Tags=[{'Key': 'Name', 'Value': sg_name}])
+                    act.warning('missing, make create: {}'.format(sg))
+                if not allow_https_all(sg.ip_permissions):
+                    act.warning(
+                        'missing HTTP permission, make authorize: {} port=443 CIDR=0.0.0.0/0'.format(
+                            sg
+                        )
+                    )
+                    sg.authorize_ingress(
+                        IpProtocol='tcp',
+                        FromPort=443,
+                        ToPort=443,
+                        CidrIp='0.0.0.0/0',
+                    )
+                endpoints = ec2c.describe_vpc_endpoints(
+                    Filters=[
+                        {'Name': 'service-name', 'Values': [service_name]},
+                        {'Name': 'vpc-id', 'Values': [vpc.id]},
+                        {'Name': 'vpc-endpoint-state', 'Values': ['pending', 'available']},
+                    ]
+                )['VpcEndpoints']
+                if endpoints:
+                    for endpoint in endpoints:
+                        sgs_in_endpoint = [group['GroupId'] for group in endpoint['Groups']]
+                        if sg.id not in sgs_in_endpoint:
+                            options = {
+                                'VpcEndpointId': endpoint['VpcEndpointId'],
+                                'AddSecurityGroupIds': [sg.id],
+                            }
+                            act.warning(
+                                'mismatch ({} not in {}), make update: {}'.format(
+                                    sg.id,
+                                    sgs_in_endpoint,
+                                    ec2c.modify_vpc_endpoint(**options),
+                                )
+                            )
+                        if not endpoint['PrivateDnsEnabled']:
+                            options = {
+                                'VpcEndpointId': endpoint['VpcEndpointId'],
+                                'PrivateDnsEnabled': True,
+                            }
+                            act.warning(
+                                'mismatch (PrivateDns not enabled), make update: {}'.format(
+                                    ec2c.modify_vpc_endpoint(**options),
+                                )
+                            )
+                        subnet_in_endpoint = set(endpoint['SubnetIds'])
+                        if subnet_in_endpoint != subnets:
+                            options = {'VpcEndpointId': endpoint['VpcEndpointId']}
+                            if subnet_in_endpoint.difference(subnets):
+                                options['RemoveSubnetIds'] = list(
+                                    subnet_in_endpoint.difference(subnets)
+                                )
+                            if subnets.difference(subnet_in_endpoint):
+                                options['AddSubnetIds'] = list(
+                                    subnets.difference(subnet_in_endpoint)
+                                )
+                            act.warning(
+                                'mismatch ({} vs. {}), make update: {}'.format(
+                                    subnet_in_endpoint,
+                                    subnets,
+                                    ec2c.modify_vpc_endpoint(**options),
+                                )
+                            )
+                else:
+                    options = {
+                        'VpcEndpointType': 'Interface',
+                        'VpcId': vpc.id,
+                        'ServiceName': service_name,
+                        'SubnetIds': list(subnets),
+                        'SecurityGroupIds': [sg.id],
+                        'PrivateDnsEnabled': True,
+                        'ClientToken': hashlib.md5(
+                            '{}-{}-{}:{}'.format(
+                                service_name, region, vpc.id, sorted(list(subnets))
+                            ).encode('utf-8')
+                        ).hexdigest(),
+                    }
+                    act.warning(
+                        'missing, make create: {}'.format(
+                            ec2c.create_vpc_endpoint(**options)
+                        )
+                    )
         else:
             info('found new possible service endpoint: {}'.format(service_name))
 
@@ -781,3 +876,20 @@ def cleanup_vpc(account: AccountData, region: str):
     with ActionOnExit('Delete Elastic IPs..'):
         for eip in ec2c.describe_addresses()['Addresses']:
             ec2c.release_address(AllocationId=eip['AllocationId'])
+
+
+def get_sg(name: str, desc: str, sgs: list) -> object:
+    for sg in sgs:
+        if sg.group_name == name and sg.description == desc:
+            return sg
+
+
+def allow_https_all(permissions: list) -> bool:
+    for permission in permissions:
+        if (
+            permission['IpProtocol'] == 'tcp'
+            and permission['FromPort'] == 443
+            and permission['ToPort'] == 443
+            and {'CidrIp': '0.0.0.0/0'} in permission['IpRanges']
+        ):
+            return True
